@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prospect Intelligence — Brief + Extraction Log</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171b22; --line:#2a3140; --txt:#e8ecf3; --mut:#9aa4b5; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --acc:#58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:14px/1.5 system-ui, sans-serif; }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; }
+  header h1 { font-size:17px; margin:0; }
+  header span { color:var(--mut); font-size:12px; }
+  main { display:grid; grid-template-columns: 340px 1fr; gap:16px; padding:16px 24px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); margin:0 0 10px; }
+  label { display:block; font-size:12px; color:var(--mut); margin:8px 0 3px; }
+  input, textarea { width:100%; background:#0d1016; color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:8px; font:inherit; }
+  button { background:var(--acc); color:#04121f; border:0; border-radius:6px; padding:9px 14px; font-weight:700; cursor:pointer; margin-top:10px; width:100%; }
+  button:disabled { opacity:.5; cursor:wait; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:20px; font-size:11px; font-weight:700; }
+  .ok { background:#12361f; color:var(--ok); } .warn { background:#3a2c07; color:var(--warn); }
+  .bad { background:#3d1414; color:var(--bad); } .info { background:#0c2a4a; color:var(--acc); }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:5px 7px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--mut); font-weight:600; }
+  .mono { font-family:ui-monospace, monospace; font-size:11px; word-break:break-all; }
+  .q { border-left:3px solid var(--acc); padding-left:10px; margin:10px 0; }
+  .q h3 { margin:0 0 4px; font-size:14px; }
+  #status { color:var(--mut); font-size:12px; margin-top:8px; white-space:pre-wrap; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:1000px){ main{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<header><h1>Prospect Intelligence</h1><span>brief + extraction trail &middot; fluent and wrong is worse than absent</span></header>
+<main>
+  <div>
+    <div class="card">
+      <h2>Run a brief</h2>
+      <label>Person's full name</label><input id="name" value="" placeholder="e.g. Jane Doe">
+      <label>Company</label><input id="company" value="" placeholder="e.g. Acme Corp">
+      <label>Query (optional)</label><input id="query" placeholder="expansion plans">
+      <label>URLs, one per line (optional)</label><textarea id="urls" rows="3"></textarea>
+      <button id="go" onclick="runBrief()">Research + verify + brief</button>
+      <div id="status">Idle. Fill name + company, click Research.</div>
+    </div>
+    <div class="card">
+      <h2>Company brief (no person needed)</h2>
+      <label>Company</label><input id="cocompany" value="" placeholder="e.g. Acme Corp">
+      <button id="cogo" onclick="runCompanyBrief()">Company brief</button>
+      <div id="costatus" style="color:var(--mut);font-size:12px;margin-top:8px;white-space:pre-wrap;"></div>
+    </div>
+  </div>
+  <div>
+    <div class="card"><h2>Answers — the four questions</h2><div id="brief">No brief yet. Fill name + company, click Research.</div></div>
+  </div>
+<script>
+const REQ_TIMEOUT_MS = 240000;  // 240s = PROSPECT_API_DEADLINE_S (210s) + 30s margin; backend never hangs past 210s
+async function postJSON(url, body, st, busyText){
+  const ctl = new AbortController();
+  const timer = setTimeout(()=>ctl.abort(), REQ_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body), signal: ctl.signal});
+    if(!r.ok){ const e = await r.json().catch(()=>({detail:r.status})); throw new Error(e.detail || r.status); }
+    return await r.json();
+  } catch(e){
+    if(e && e.name === 'AbortError') throw new Error('timed out after 4 min — try a company-only brief, fewer URLs, or check the server terminal, then retry');
+    throw e;
+  } finally { clearTimeout(timer); }
+}
+async function runBrief(){
+  const go = document.getElementById('go'), st = document.getElementById('status');
+  go.disabled = true;
+  const body = {
+    name: document.getElementById('name').value.trim(),
+    company: document.getElementById('company').value.trim(),
+    query: document.getElementById('query').value.trim(),
+    urls: document.getElementById('urls').value.split('\n').map(s=>s.trim()).filter(Boolean),
+    max_results: 8
+  };
+  if(!body.name && !body.company && !body.query && !body.urls.length){
+    st.textContent = 'Fill name + company (or a query, or paste URLs), then click Research.';
+    go.disabled = false;
+    return;
+  }
+  try {
+    st.textContent = 'Step 1: discovery → fetch → candidates with evidence…';
+    // NOTE: identity is NEVER auto-confirmed. You pick a candidate (§6.3).
+    const d = await postJSON('/research', body);
+    if(d.status === 'needs_confirmation'){ renderCandidates(d); st.textContent = `Fetched ${d.fetched.length} docs. Select the right person to run Passes 2–4.`; }
+    else { renderBrief(d.brief, d.fused); st.textContent = 'Done.' + (d.warning ? ' — ' + d.warning : ''); }
+  } catch(e){ st.textContent = 'Error: ' + e; }
+  go.disabled = false;
+}
+function esc(s){ return String(s ?? '').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+async function runCompanyBrief(){
+  const go = document.getElementById('cogo'), st = document.getElementById('costatus');
+  go.disabled = true;
+  const company = document.getElementById('cocompany').value.trim();
+  if(!company){ st.textContent = 'Enter a company name first.'; go.disabled = false; return; }
+  try {
+    st.textContent = 'Company discovery → firmographics → strategy → pitch…';
+    const d = await postJSON('/company-research', {company, max_results: 8});
+    renderBrief(d.brief, d.fused);
+    if(d.timings){ const t = d.timings; st.textContent += ` (discovery ${t.discovery_s||'?'}s → fetch ${t.fetch_diet_probe_s||'?'}s → firmo ${t.firmographics_s||'?'}s → strategy ${t.strategy_s||'?'}s → synthesis ${t.synthesis_s||'?'}s)`; }
+    document.getElementById('status').textContent = 'Done. Company brief ' + d.id + ' — no person researched.';
+    st.textContent = 'Done. Company brief ' + d.id;
+  } catch(e){ st.textContent = 'Error: ' + e; }
+  go.disabled = false;
+}
+function renderCandidates(d){
+  document.getElementById('brief').innerHTML =
+    `<div class="q"><h3>Who is this person? — select to proceed (mandatory gate)</h3>` +
+    d.candidates.map((c,i)=>`<div style="margin:8px 0"><b>[${i}] ${esc(c.full_name)} @ ${esc(c.company)}</b> <span class="pill info">conf ${c.confidence}</span><br><span class="mono">${esc((c.sources||[]).slice(0,3).join(', '))}</span><br><button style="width:auto" onclick="confirmBrief('${d.session_id}',${i})">This is the person →</button></div>`).join('') +
+    `</div>${(d.degraded||[]).map(g=>`<div>• ${esc(g)}</div>`).join('')}`;
+}
+let docUrls = {};
+async function confirmBrief(session_id, index){
+  const st = document.getElementById('status');
+  try{
+    st.textContent = 'Step 2: Pass 2 firmographics → Pass 3 strategy → Pass 4 pitch…';
+    const d = await postJSON('/research/confirm', {session_id, index});
+    docUrls = d.doc_urls || {};
+    renderBrief(d.brief, d.fused);
+    st.textContent = 'Done. Brief ' + d.id;
+  }catch(e){ st.textContent = 'Error: ' + e; }
+}
+function toggleSources(){
+  const el = document.getElementById('srcpanel');
+  if(!el) return;
+  const open = el.style.display !== 'none';
+  el.style.display = open ? 'none' : 'block';
+  document.getElementById('srcbtn').textContent = open ? 'Show sources' : 'Hide sources';
+}
+function cleanText(s){
+  // display text only: drop Outlet:/Published: metadata lines and outlet
+  // suffixes (" - variety.com"). Provenance lives in Sources panel.
+  return String(s ?? '').split('\n')
+    .filter(ln => ln.trim() && !/^(outlet|published)\s*:/i.test(ln.trim()))
+    .join(' ').replace(/\s+-\s+[A-Za-z][\w. ]{2,60}$/, '').trim();
+}
+function srcLink(docId){
+  const u = (typeof docUrls !== 'undefined' && docUrls[docId]) || '';
+  return u ? ` <a href="${esc(u)}" target="_blank" style="color:var(--acc)">source ↗</a>` : '';
+}
+function renderBrief(b, fused){
+  if(!b){ document.getElementById('brief').textContent = 'No brief.'; return; }
+  const pr = (b.priorities||[]).map((p,i)=>`<div style="margin:6px 0">${i+1}. ${esc(cleanText(p.statement).slice(0,260))}</div>`).join('') || '(none — see unknowns)';
+  const fusedTxt = (fused||[]).map((s,i)=>`<div>• <b>${esc(s.signal||'').slice(0,160)}</b> <span class="pill info">${esc(s.confidence||'')} · ${esc(s.recency||'')} · ${s.evidence_count||1} ev</span></div>`).join('');
+  const prSrc = (b.priorities||[]).map((p,i)=>`<div class="mono">${i+1}. ${esc((p.evidence||[]).join(','))} · recency=${esc(p.recency)} conf=${p.confidence}${srcLink((p.evidence||[]).length ? (function(){ const c=(b.strategy_signals||[]).find(v=>v.claim.claim_id===(p.evidence||[])[0]); return c?c.claim.doc_id:''; })() : '')}</div>`).join('');
+  const un = (b.gaps||[]).map(g=>`<div>• ${esc(g)}</div>`).join('');
+  const dg = (b.degraded||[]).map(g=>`<div>• ${esc(g)}</div>`).join('');
+  const pd = (b.person_details||[]).map((v,i)=>`<div style="margin:6px 0">${i+1}. ${esc(cleanText(v.claim?.text||'').slice(0,300))}</div>`).join('') || '(none — no verified facts found)';
+  const pdSrc = (b.person_details||[]).map((v,i)=>`<div class="mono">${i+1}. ${esc(v.verdict||'')} · recency=${esc(v.claim?.recency||'')} · ${esc(v.claim?.claim_id||'')}${srcLink(v.claim?.doc_id||'')}</div>`).join('');
+  const roles = (b.current_roles||[]).map(r=>`<div>• ${esc(r.role?r.role+' @ ': '')}${esc(r.company)}</div>`).join('');
+  const rolesSrc = (b.current_roles||[]).map(r=>`<div class="mono">• ${esc(r.company)} ← ${esc((r.evidence||[]).slice(0,2).join(','))}</div>`).join('');
+  const refsSrc = (b.references||[]).map(r=>`<div>↗ <a href="${esc(r.url)}" target="_blank" style="color:var(--acc)">${esc(r.label)}</a> <span class="mono">${esc(r.note||'')}</span></div>`).join('');
+  const firmo = b.firmographic||{};
+  const firmoKeys = ['company','registry','industry','hq','employees','founded','revenue','funding','website_probe','homepage','lei','filings'];
+  const firmoTxt = firmoKeys.filter(k=>firmo[k]!==undefined && firmo[k]!=='' && firmo[k]!==null && !(Array.isArray(firmo[k])&&!firmo[k].length)).map(k=>`<div>• <b>${esc(k)}:</b> ${esc(Array.isArray(firmo[k])?firmo[k].join(', ')||'—':String(firmo[k]))}</div>`).join('');
+  const firmoSrc = `<div class="mono">sources: ${esc(JSON.stringify(firmo.sources||[]))}</div>`;
+  const bio = b.bio||{};
+  const bioRow = (label, vals)=> (vals&&vals.length) ? `<div>• <b>${label}:</b> ${vals.map(v=>esc(v)).join(' · ')}</div>` : '';
+  const bioTxt = (bioRow('Full name', bio.full_name) + bioRow('Born', bio.birth) + bioRow('Father', bio.father) + bioRow('Mother', bio.mother) + bioRow('Parents', bio.parents) + bioRow('Spouse', bio.spouse) + bioRow('Children', bio.children) + bioRow('Education / qualifications', bio.education) + bioRow('Career / industry experience', bio.career)) || '(none — no bio extracted)';
+  document.getElementById('brief').innerHTML = `
+    <div class="q"><h3>1. ${(b.person&&b.person.full_name)?'Who is this person?':'Company-only brief — no person researched'}</h3>${(b.person&&b.person.full_name)?esc(b.person.full_name)+' @ '+esc(b.person.company):esc(b.person.company)}
+      <div>${roles}</div>
+      <div style="margin-top:8px"><b>Profile — full bio (all years):</b></div><div style="margin-top:4px">${bioTxt}</div>
+      <div style="margin-top:8px"><b>Recent verified facts (last 2–3 years):</b></div><div style="margin-top:4px">${pd}</div></div>
+    <div class="q"><h3>2. What does their company look like?</h3>${firmoTxt||'(none)'}</div>
+    <div class="q"><h3>3. What is their company trying to do this year?</h3>${pr}${fusedTxt?`<div style="margin-top:8px"><b>Fused signals (cross-source):</b></div><div style="margin-top:4px">${fusedTxt}</div>`:''}</div>
+    <div class="q"><h3>Unknowns</h3>${un||'(none)'}</div>
+    ${dg?`<div class="q"><h3>Degraded inputs</h3>${dg}</div>`:''}
+    <div style="margin-top:8px"><button id="srcbtn" style="width:auto" onclick="toggleSources()">Show sources</button>
+    <div id="srcpanel" style="display:none; margin-top:8px; border-top:1px solid var(--line); padding-top:8px;">
+      <h3 style="font-size:13px">Sources</h3>
+      ${rolesSrc}${refsSrc?'<div style="margin-top:6px">'+refsSrc+'</div>':''}
+      <div style="margin-top:6px"><b>Person facts provenance:</b></div>${pdSrc||'<div class="mono">—</div>'}
+      <div style="margin-top:6px"><b>Priorities provenance:</b></div>${prSrc||'<div class="mono">—</div>'}
+      <div style="margin-top:6px"><b>Company provenance:</b></div>${firmoSrc}
+    </div></div>`;
+}
+</script>
+</body>
+</html>

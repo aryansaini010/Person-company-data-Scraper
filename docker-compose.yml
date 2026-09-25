@@ -1,0 +1,72 @@
+networks:
+  dmz:
+  core:
+  data:
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-prospect_intel}
+      POSTGRES_USER: ${POSTGRES_USER:-prospect}
+      # P0: never ship default 'prospect' in prod — set POSTGRES_PASSWORD in .env.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-prospect}
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    networks: [data]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-prospect}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  opensearch:
+    image: opensearchproject/opensearch:2.15.0
+    environment:
+      - discovery.type=single-node
+      # Dev-only: disables auth. Enable security plugin in prod.
+      - DISABLE_SECURITY_PLUGIN=true
+    ports: ["9200:9200"]
+    volumes: [osdata:/usr/share/opensearch/data]
+    networks: [data]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [miniodata:/data]
+    networks: [data]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+  # NOTE: SearXNG + Firecrawl are EXTERNAL and reused — do NOT duplicate here.
+  # Configure via SEARXNG_URL + FIRECRAWL_URL in .env (defaults below).
+  # - SearXNG: external compose (restart: unless-stopped, :8080)
+  # - Firecrawl: external compose (restart: unless-stopped, :3002)
+  # They auto-start with Docker Desktop; no manual restart needed.
+  # Optional local fallback (only if external is gone):
+  #   docker compose --profile local-searxng up -d
+  searxng-local-fallback:
+    image: searxng/searxng:latest
+    profiles: [local-searxng]
+    ports: ["127.0.0.1:8082:8080"]
+    environment:
+      - BASE_URL=http://localhost:8082/
+      - UWSGI_WORKERS=2
+    volumes: [searxdata:/etc/searxng]
+    restart: unless-stopped
+volumes:
+  pgdata:
+  osdata:
+  searxdata:
+  miniodata:

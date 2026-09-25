@@ -1,0 +1,24 @@
+{"expected": "supported", "claim": "Acme will expand platform engineering hiring in Berlin.", "span": "Acme will expand platform engineering hiring in Berlin to support enterprise growth."}
+{"expected": "supported", "claim": "The CEO said cloud revenue grew 30 percent.", "span": "Our CEO said on the earnings call that cloud revenue grew 30 percent year over year."}
+{"expected": "supported", "claim": "Acme opened a new office in Austin.", "span": "Acme opened a new office in Austin last quarter, hiring 200 engineers."}
+{"expected": "supported", "claim": "The company cut its dividend.", "span": "In the filing, the company cut its dividend from 50 cents to 20 cents per share."}
+{"expected": "supported", "claim": "Hiring is frozen for the sales team.", "span": "An internal memo states hiring is frozen for the sales team through Q3."}
+{"expected": "supported", "claim": "Acme acquired BetaCorp for 40 million.", "span": "Acme acquired BetaCorp for 40 million in cash, the press release confirms."}
+{"expected": "supported", "claim": "The CFO resigned in March.", "span": "The CFO resigned in March according to the company announcement."}
+{"expected": "supported", "claim": "R&D spending doubled.", "span": "R&D spending doubled compared with the previous fiscal year."}
+{"expected": "partially_supported", "claim": "Acme will expand platform engineering hiring in Berlin. Quantum zebras orbit Jupiter nightly.", "span": "Acme will expand platform engineering hiring in Berlin to support enterprise growth. The weather in Berlin is mild today."}
+{"expected": "partially_supported", "claim": "Revenue grew 30 percent. The CEO also announced a Mars colony.", "span": "Revenue grew 30 percent year over year, the CEO said on the call."}
+{"expected": "partially_supported", "claim": "Acme opened a new Austin office. It employs ten thousand people.", "span": "Acme opened a new office in Austin last quarter, hiring 200 engineers."}
+{"expected": "partially_supported", "claim": "The dividend was cut. Shareholders rioted at headquarters.", "span": "In the filing, the company cut its dividend from 50 cents to 20 cents per share."}
+{"expected": "partially_supported", "claim": "Hiring is frozen for sales. Engineering was also shut down worldwide.", "span": "An internal memo states hiring is frozen for the sales team through Q3."}
+{"expected": "partially_supported", "claim": "Acme acquired BetaCorp. The deal was worth nine trillion dollars.", "span": "Acme acquired BetaCorp for 40 million in cash, the press release confirms."}
+{"expected": "unsupported", "claim": "Acme acquired a semiconductor fab.", "span": "Acme sells muffins and pastries in three downtown locations."}
+{"expected": "unsupported", "claim": "The CEO resigned amid fraud allegations.", "span": "The CEO praised the quarterly results and thanked the engineering team."}
+{"expected": "unsupported", "claim": "Acme is bankrupt.", "span": "Acme reported record profits and raised guidance for next quarter."}
+{"expected": "unsupported", "claim": "The company laid off ten thousand workers.", "span": "The company announced it will hire ten thousand workers this year."}
+{"expected": "unsupported", "claim": "Acme merged with Globex.", "span": "Acme signed a small reseller partnership with a local vendor."}
+{"expected": "unsupported", "claim": "Regulators fined Acme one billion dollars.", "span": "No regulatory actions were disclosed in the filing."}
+{"expected": "unsupported", "claim": "", "span": "Acme reported record profits this quarter."}
+{"expected": "unsupported", "claim": "Acme grew revenue.", "span": "   "}
+{"expected": "unsupported", "claim": "The CTO predicted flying cars by Tuesday.", "span": "The CTO discussed cloud migration timelines for the next two years."}
+{"expected": "unsupported", "claim": "Acme closed all European offices.", "span": "Acme opened a new office in Austin last quarter."}
