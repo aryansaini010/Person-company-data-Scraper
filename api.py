@@ -147,6 +147,35 @@ def _persist_brief(bid: str, brief: Brief) -> None:
         pass
 
 
+def _auto_push_brief(bid: str, brief: Brief) -> dict:
+    """Best-effort auto-push: readable .txt into Open WebUI Files
+    (+ Knowledge when OPENWEBUI_KNOWLEDGE_ID is set). Never raises —
+    failures return a note and leave the brief itself unaffected."""
+    if (_os.environ.get("OPENWEBUI_AUTO_PUSH", "") == "0"
+            or "PYTEST_CURRENT_TEST" in _os.environ
+            or "pytest" in __import__("sys").modules):
+        return {"openwebui_file_id": None,
+                "openwebui_note": "auto-push skipped (disabled under test)"}
+    try:
+        from prospect_intel.export import export_readable
+        from prospect_intel import openwebui as _ow
+        import tempfile
+        from pathlib import Path
+        tmp = Path(tempfile.gettempdir()) / f"{bid}.txt"
+        export_readable(brief, {}, tmp)
+        kid = (_os.environ.get("OPENWEBUI_KNOWLEDGE_ID", "") or "").strip()
+        fid, note = _ow.upload_brief_file(str(tmp), kid)
+        try:
+            audit.log("openwebui_auto_push", {"id": bid, "file": fid,
+                                              "note": note})
+        except Exception:
+            pass
+        return {"openwebui_file_id": fid, "openwebui_note": note}
+    except Exception as e:
+        return {"openwebui_file_id": None,
+                "openwebui_note": f"auto-push skipped: {type(e).__name__}"}
+
+
 def _hunter_enrich(firmo: dict, company: str, docs: list[StructuredDoc],
                    degraded: list) -> dict:
     """Hunter-by-domain (free key, quota-guarded): homepage/website_probe
@@ -386,7 +415,7 @@ def create_brief(req: BriefRequest):
         _persist_brief(bid, brief)
     except Exception:
         pass
-    return {"id": bid, "brief": brief}
+    return {"id": bid, "brief": brief, **_auto_push_brief(bid, brief)}
 
 
 @app.post("/research")
@@ -571,7 +600,8 @@ def research_confirm(req: ResearchConfirm):
         _fused = []
     return {"status": "brief", "id": bid, "brief": brief,
             "doc_urls": doc_urls, "evidence": _evidence_flat(brief, doc_urls),
-            "unknowns": _unknowns_flat(brief), "fused": _fused}
+            "unknowns": _unknowns_flat(brief), "fused": _fused,
+            **_auto_push_brief(bid, brief)}
 
 
 class CompanyRequest(BaseModel):
@@ -755,7 +785,7 @@ def company_research(req: CompanyRequest):
             "fetched": len(docs), "doc_urls": doc_urls,
             "evidence": _evidence_flat(brief, doc_urls),
             "unknowns": _unknowns_flat(brief), "fused": fused,
-            "timings": _timings}
+            "timings": _timings, **_auto_push_brief(bid, brief)}
 
 
 def _evidence_flat(brief: Brief, doc_urls: dict) -> list[dict]:
