@@ -172,6 +172,14 @@ def export_readable(brief, docs_by_id: dict, path: Path | str) -> Path:
             L.append(f"  B ({c.recency_b}): {_flat(c.claim_b, 250)}")
     if brief.opening_question:
         L.append(f"[Opening question] {_flat(brief.opening_question, 400)}")
+    _gen = getattr(brief, "general_knowledge", None) or []
+    if _gen:
+        L.append("\n[General background — UNVERIFIED, not from fetched docs]")
+        for g in _gen[:3]:
+            if isinstance(g, dict) and g.get("text"):
+                L.append(f"- {_flat(g.get('text'), 500)}")
+                L.append(f"  ({g.get('label', 'GENERAL-KNOWLEDGE-UNVERIFIED')}"
+                         f" · {g.get('model', '')} via {g.get('via', '')})")
     L.append("\n[Unknowns]")
     for g in brief.gaps or ["(none)"]:
         L.append(f"- {_flat(g, 300)}")

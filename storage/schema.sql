@@ -63,6 +63,15 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at TIMESTAMPTZ NOT NULL DEFAULT now() + INTERVAL '30 minutes'
 );
 CREATE INDEX IF NOT EXISTS sessions_expires_idx ON sessions (expires_at);
+-- Participant uploads (CSV/XLSX parsed rows, Phone/Mobile dropped on parse).
+CREATE TABLE IF NOT EXISTS uploads (
+  id TEXT PRIMARY KEY,
+  filename TEXT NOT NULL DEFAULT '',
+  rows_json JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL DEFAULT now() + INTERVAL '1 hour'
+);
+CREATE INDEX IF NOT EXISTS uploads_expires_idx ON uploads (expires_at);
 -- Tier-1 enrichment cache (30d TTL enforced in app) + usage quotas.
 CREATE TABLE IF NOT EXISTS enrich_cache (
   source TEXT NOT NULL,

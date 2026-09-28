@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS collateral(id TEXT PRIMARY KEY, text TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS briefs(id TEXT PRIMARY KEY, data TEXT NOT NULL, created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, data TEXT NOT NULL,
  created_at REAL NOT NULL, expires_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS uploads(id TEXT PRIMARY KEY, filename TEXT NOT NULL,
+ rows_json TEXT NOT NULL, created_at REAL NOT NULL, expires_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS audit_log(seq INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL NOT NULL, event TEXT NOT NULL, payload TEXT NOT NULL,
  prev_hash TEXT NOT NULL, hash TEXT NOT NULL);
@@ -46,6 +48,7 @@ CREATE INDEX IF NOT EXISTS audit_event_idx ON audit_log(event);
 CREATE INDEX IF NOT EXISTS queue_received_idx ON queue(received);
 CREATE INDEX IF NOT EXISTS briefs_created_idx ON briefs(created_at);
 CREATE INDEX IF NOT EXISTS sessions_expires_idx ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS uploads_expires_idx ON uploads(expires_at);
 """
 
 
@@ -376,6 +379,59 @@ def session_sweep(con: sqlite3.Connection, now: float | None = None) -> int:
     now = now if now is not None else time.time()
     try:
         cur = con.execute("DELETE FROM sessions WHERE expires_at<=?", (now,))
+        con.commit()
+        return cur.rowcount or 0
+    except Exception:
+        return 0
+
+
+UPLOAD_TTL_S = 3600.0  # participant lists live 1h (longer than confirm gates)
+
+
+def upload_save(con: sqlite3.Connection, uid: str, filename: str,
+                rows: list[dict], ttl_s: float = UPLOAD_TTL_S) -> None:
+    """Persist a parsed participant upload (Phone/Mobile already dropped).
+
+    Rows are plain JSON (no pydantic); filename stored for audit only.
+    Overwrites same id (uuid per upload, so effectively insert-only).
+    """
+    now = time.time()
+    try:
+        payload = json.dumps(rows)
+    except (ValueError, TypeError):
+        payload = json.dumps([])
+    con.execute("INSERT OR REPLACE INTO uploads VALUES (?,?,?,?,?)",
+                (uid, (filename or "")[:200], payload, now, now + ttl_s))
+    con.commit()
+
+
+def upload_load(con: sqlite3.Connection, uid: str) -> tuple[str, list[dict]] | None:
+    """Return (filename, rows) or None if unknown/expired."""
+    row = con.execute("SELECT filename, rows_json, expires_at FROM uploads"
+                      " WHERE id=?", (uid,)).fetchone()
+    if not row:
+        return None
+    filename, payload, expires_at = row
+    if time.time() > (expires_at or 0):
+        try:
+            con.execute("DELETE FROM uploads WHERE id=?", (uid,))
+            con.commit()
+        except Exception:
+            pass
+        return None
+    try:
+        rows = json.loads(payload or "[]")
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    return filename, rows
+
+
+def upload_sweep(con: sqlite3.Connection, now: float | None = None) -> int:
+    now = now if now is not None else time.time()
+    try:
+        cur = con.execute("DELETE FROM uploads WHERE expires_at<=?", (now,))
         con.commit()
         return cur.rowcount or 0
     except Exception:

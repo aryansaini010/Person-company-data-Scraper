@@ -15,7 +15,7 @@
   .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
   .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); margin:0 0 10px; }
   label { display:block; font-size:12px; color:var(--mut); margin:8px 0 3px; }
-  input, textarea { width:100%; background:#0d1016; color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:8px; font:inherit; }
+  input, textarea, select { width:100%; background:#0d1016; color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:8px; font:inherit; }
   button { background:var(--acc); color:#04121f; border:0; border-radius:6px; padding:9px 14px; font-weight:700; cursor:pointer; margin-top:10px; width:100%; }
   button:disabled { opacity:.5; cursor:wait; }
   .pill { display:inline-block; padding:1px 8px; border-radius:20px; font-size:11px; font-weight:700; }
@@ -37,6 +37,15 @@
 <main>
   <div>
     <div class="card">
+      <h2>Participants (CSV / XLSX)</h2>
+      <label>Upload file (.csv / .xlsx, multi-row)</label><input id="pfile" type="file" accept=".csv,.xlsx,.xlsm">
+      <button id="pupgo" onclick="uploadParticipants()">Upload + list people</button>
+      <label>Select name + company</label><select id="person_sel" onchange="loadParticipant()"><option value="">Upload first…</option></select>
+      <div id="ppreview" class="mono" style="margin-top:8px; white-space:pre-wrap;"></div>
+      <button id="puse" onclick="useParticipant()">Use in brief ↓</button>
+      <div id="pstatus" style="color:var(--mut);font-size:12px;margin-top:8px;white-space:pre-wrap;">No file yet. Phone/Mobile are ignored.</div>
+    </div>
+    <div class="card">
       <h2>Run a brief</h2>
       <label>Person's full name</label><input id="name" value="" placeholder="e.g. Jane Doe">
       <label>Company</label><input id="company" value="" placeholder="e.g. Acme Corp">
@@ -44,12 +53,6 @@
       <label>URLs, one per line (optional)</label><textarea id="urls" rows="3"></textarea>
       <button id="go" onclick="runBrief()">Research + verify + brief</button>
       <div id="status">Idle. Fill name + company, click Research.</div>
-    </div>
-    <div class="card">
-      <h2>Company brief (no person needed)</h2>
-      <label>Company</label><input id="cocompany" value="" placeholder="e.g. Acme Corp">
-      <button id="cogo" onclick="runCompanyBrief()">Company brief</button>
-      <div id="costatus" style="color:var(--mut);font-size:12px;margin-top:8px;white-space:pre-wrap;"></div>
     </div>
   </div>
   <div>
@@ -77,7 +80,8 @@ async function runBrief(){
     company: document.getElementById('company').value.trim(),
     query: document.getElementById('query').value.trim(),
     urls: document.getElementById('urls').value.split('\n').map(s=>s.trim()).filter(Boolean),
-    max_results: 8
+    max_results: 8,
+    user_supplied: (window._userSupplied || {})
   };
   if(!body.name && !body.company && !body.query && !body.urls.length){
     st.textContent = 'Fill name + company (or a query, or paste URLs), then click Research.';
@@ -94,26 +98,54 @@ async function runBrief(){
   go.disabled = false;
 }
 function esc(s){ return String(s ?? '').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
-async function runCompanyBrief(){
-  const go = document.getElementById('cogo'), st = document.getElementById('costatus');
-  go.disabled = true;
-  const company = document.getElementById('cocompany').value.trim();
-  if(!company){ st.textContent = 'Enter a company name first.'; go.disabled = false; return; }
-  try {
-    st.textContent = 'Company discovery → firmographics → strategy → pitch…';
-    const d = await postJSON('/company-research', {company, max_results: 8});
-    renderBrief(d.brief, d.fused);
-    if(d.timings){ const t = d.timings; st.textContent += ` (discovery ${t.discovery_s||'?'}s → fetch ${t.fetch_diet_probe_s||'?'}s → firmo ${t.firmographics_s||'?'}s → strategy ${t.strategy_s||'?'}s → synthesis ${t.synthesis_s||'?'}s)`; }
-    document.getElementById('status').textContent = 'Done. Company brief ' + d.id + ' — no person researched.';
-    st.textContent = 'Done. Company brief ' + d.id;
-  } catch(e){ st.textContent = 'Error: ' + e; }
+let _uploadId = '', _peopleCache = {};
+async function uploadParticipants(){
+  const inp = document.getElementById('pfile'), st = document.getElementById('pstatus'), go = document.getElementById('pupgo');
+  if(!inp.files || !inp.files.length){ st.textContent = 'Choose a .csv or .xlsx file first.'; return; }
+  go.disabled = true; st.textContent = 'Uploading + parsing…';
+  try{
+    const fd = new FormData(); fd.append('file', inp.files[0]);
+    const ctl = new AbortController(); const timer = setTimeout(()=>ctl.abort(), 60000);
+    let r;
+    try{ r = await fetch('/participants/upload', {method:'POST', body: fd, signal: ctl.signal}); }
+    finally{ clearTimeout(timer); }
+    if(!r.ok){ const e = await r.json().catch(()=>({detail:r.status})); throw new Error(e.detail || r.status); }
+    const d = await r.json();
+    _uploadId = d.upload_id; _peopleCache = {};
+    const sel = document.getElementById('person_sel');
+    sel.innerHTML = d.people.map(p=>`<option value="${esc(p.pid)}">${esc(p.display)}</option>`).join('') || '<option value="">(empty)</option>';
+    st.textContent = `Done. ${d.count} people from ${d.filename} (${d.upload_id}). Pick a name+company.` + ((d.notes||[]).length ? ' Notes: ' + d.notes.join('; ') : '');
+    if(d.people.length) loadParticipant();
+  }catch(e){ st.textContent = 'Error: ' + (e && e.name === 'AbortError' ? 'upload timed out' : e); }
   go.disabled = false;
+}
+async function loadParticipant(){
+  const sel = document.getElementById('person_sel'), prev = document.getElementById('ppreview'), st = document.getElementById('pstatus');
+  const pid = sel.value; if(!pid || !_uploadId) return;
+  try{
+    const r = await fetch(`/participants/${encodeURIComponent(_uploadId)}/${encodeURIComponent(pid)}`);
+    if(!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    const p = d.person || {}; _peopleCache[pid] = p;
+    const line = (k,v)=> v ? `${k}: ${v}\n` : '';
+    prev.textContent = line('Name', p.full_name) + line('Company', p.company_raw || p.company_primary) + line('Position', p.position) + line('Corp email', p.corp_email || p.email) + line('Company phone', p.company_phone) + line('Country', p.country) + line('Type', p.participant_type) + line('Activity', p.activity) + '(Phone/Mobile excluded)';
+  }catch(e){ prev.textContent = 'Error: ' + e; }
+}
+function useParticipant(){
+  const sel = document.getElementById('person_sel'), st = document.getElementById('pstatus');
+  const p = _peopleCache[sel.value];
+  if(!p){ st.textContent = 'Select a person first (upload, then pick).'; return; }
+  document.getElementById('name').value = p.full_name || '';
+  document.getElementById('company').value = p.company_primary || p.company_raw || '';
+  window._userSupplied = {position: p.position||'', company_raw: p.company_raw||'', company_primary: p.company_primary||'', corp_email: p.corp_email||'', email: p.email||'', company_phone: p.company_phone||'', country: p.country||'', participant_type: p.participant_type||'', activity: p.activity||'', full_name: p.full_name||'', display: (p.full_name||'') + ' @ ' + (p.company_primary||'')};
+  st.textContent = `Using ${p.full_name} @ ${p.company_primary} — name+company filled, other fields attached (Phone/Mobile excluded). Click Research + verify + brief.`;
+  document.getElementById('status').textContent = `Participant selected: ${p.full_name} @ ${p.company_primary}. Click Research.`;
 }
 function renderCandidates(d){
   document.getElementById('brief').innerHTML =
     `<div class="q"><h3>Who is this person? — select to proceed (mandatory gate)</h3>` +
     d.candidates.map((c,i)=>`<div style="margin:8px 0"><b>[${i}] ${esc(c.full_name)} @ ${esc(c.company)}</b> <span class="pill info">conf ${c.confidence}</span><br><span class="mono">${esc((c.sources||[]).slice(0,3).join(', '))}</span><br><button style="width:auto" onclick="confirmBrief('${d.session_id}',${i})">This is the person →</button></div>`).join('') +
-    `</div>${(d.degraded||[]).map(g=>`<div>• ${esc(g)}</div>`).join('')}`;
+    `</div>`;
 }
 let docUrls = {};
 async function confirmBrief(session_id, index){
@@ -146,32 +178,35 @@ function srcLink(docId){
 }
 function renderBrief(b, fused){
   if(!b){ document.getElementById('brief').textContent = 'No brief.'; return; }
-  const pr = (b.priorities||[]).map((p,i)=>`<div style="margin:6px 0">${i+1}. ${esc(cleanText(p.statement).slice(0,260))}</div>`).join('') || '(none — see unknowns)';
+  const pr = (b.priorities||[]).map((p,i)=>`<div style="margin:6px 0">${i+1}. ${esc(cleanText(p.statement).slice(0,260))}</div>`).join('') || '(none — no verified priorities found)';
   const fusedTxt = (fused||[]).map((s,i)=>`<div>• <b>${esc(s.signal||'').slice(0,160)}</b> <span class="pill info">${esc(s.confidence||'')} · ${esc(s.recency||'')} · ${s.evidence_count||1} ev</span></div>`).join('');
   const prSrc = (b.priorities||[]).map((p,i)=>`<div class="mono">${i+1}. ${esc((p.evidence||[]).join(','))} · recency=${esc(p.recency)} conf=${p.confidence}${srcLink((p.evidence||[]).length ? (function(){ const c=(b.strategy_signals||[]).find(v=>v.claim.claim_id===(p.evidence||[])[0]); return c?c.claim.doc_id:''; })() : '')}</div>`).join('');
-  const un = (b.gaps||[]).map(g=>`<div>• ${esc(g)}</div>`).join('');
-  const dg = (b.degraded||[]).map(g=>`<div>• ${esc(g)}</div>`).join('');
+  // Hidden sections per user request (backend still returns them + audit keeps them).
   const pd = (b.person_details||[]).map((v,i)=>`<div style="margin:6px 0">${i+1}. ${esc(cleanText(v.claim?.text||'').slice(0,300))}</div>`).join('') || '(none — no verified facts found)';
   const pdSrc = (b.person_details||[]).map((v,i)=>`<div class="mono">${i+1}. ${esc(v.verdict||'')} · recency=${esc(v.claim?.recency||'')} · ${esc(v.claim?.claim_id||'')}${srcLink(v.claim?.doc_id||'')}</div>`).join('');
   const roles = (b.current_roles||[]).map(r=>`<div>• ${esc(r.role?r.role+' @ ': '')}${esc(r.company)}</div>`).join('');
   const rolesSrc = (b.current_roles||[]).map(r=>`<div class="mono">• ${esc(r.company)} ← ${esc((r.evidence||[]).slice(0,2).join(','))}</div>`).join('');
   const refsSrc = (b.references||[]).map(r=>`<div>↗ <a href="${esc(r.url)}" target="_blank" style="color:var(--acc)">${esc(r.label)}</a> <span class="mono">${esc(r.note||'')}</span></div>`).join('');
   const firmo = b.firmographic||{};
-  const firmoKeys = ['company','registry','industry','hq','employees','founded','revenue','funding','website_probe','homepage','lei','filings'];
-  const firmoTxt = firmoKeys.filter(k=>firmo[k]!==undefined && firmo[k]!=='' && firmo[k]!==null && !(Array.isArray(firmo[k])&&!firmo[k].length)).map(k=>`<div>• <b>${esc(k)}:</b> ${esc(Array.isArray(firmo[k])?firmo[k].join(', ')||'—':String(firmo[k]))}</div>`).join('');
+  const firmoKeys = ['company','registry','industry','hq','employees','founded','revenue','funding','website_probe','homepage','lei','filings','country_supplied'];
+  const fmtVal = (v)=> Array.isArray(v) ? (v.join(', ')||'—') : (v && typeof v === 'object' ? Object.entries(v).map(([k2,v2])=>`${k2}: ${v2}`).join('; ') : String(v));
+  const firmoTxt = firmoKeys.filter(k=>firmo[k]!==undefined && firmo[k]!=='' && firmo[k]!==null && !(Array.isArray(firmo[k])&&!firmo[k].length) && !(typeof firmo[k]==='object' && !Array.isArray(firmo[k]) && !Object.keys(firmo[k]).length)).map(k=>`<div>• <b>${esc(k)}:</b> ${esc(fmtVal(firmo[k]))}</div>`).join('');
+  const supplied = firmo.contact_supplied || firmo.participant_supplied || null;
+  const suppliedTxt = supplied ? `<div style="margin-top:6px"><b>Supplied contact (user file, unverified — Phone/Mobile excluded):</b><div class="mono">${esc(typeof supplied === 'string' ? supplied : Object.entries(supplied).map(([k2,v2])=>`${k2}: ${v2}`).join(' · '))}</div></div>` : '';
+  const gen = b.general_knowledge||[];
+  const genTxt = gen.length ? `<div style="margin-top:8px"><b>General background (unverified — ${esc(gen[0].model||'local model')} via ${esc(gen[0].via||'Open Web UI')}, no fetched docs):</b>${gen.map(g=>`<div style="margin-top:4px">${esc(g.text||'')}</div><div class="mono">${esc(g.label||'')} · ${esc(g.model||'')}</div>`).join('')}</div>` : '';
   const firmoSrc = `<div class="mono">sources: ${esc(JSON.stringify(firmo.sources||[]))}</div>`;
   const bio = b.bio||{};
   const bioRow = (label, vals)=> (vals&&vals.length) ? `<div>• <b>${label}:</b> ${vals.map(v=>esc(v)).join(' · ')}</div>` : '';
   const bioTxt = (bioRow('Full name', bio.full_name) + bioRow('Born', bio.birth) + bioRow('Father', bio.father) + bioRow('Mother', bio.mother) + bioRow('Parents', bio.parents) + bioRow('Spouse', bio.spouse) + bioRow('Children', bio.children) + bioRow('Education / qualifications', bio.education) + bioRow('Career / industry experience', bio.career)) || '(none — no bio extracted)';
   document.getElementById('brief').innerHTML = `
     <div class="q"><h3>1. ${(b.person&&b.person.full_name)?'Who is this person?':'Company-only brief — no person researched'}</h3>${(b.person&&b.person.full_name)?esc(b.person.full_name)+' @ '+esc(b.person.company):esc(b.person.company)}
+      ${b.person&&(b.person.title||b.person.role)?`<div>• <b>Title (supplied/file):</b> ${esc(b.person.title||b.person.role)}</div>`:''}
       <div>${roles}</div>
       <div style="margin-top:8px"><b>Profile — full bio (all years):</b></div><div style="margin-top:4px">${bioTxt}</div>
       <div style="margin-top:8px"><b>Recent verified facts (last 2–3 years):</b></div><div style="margin-top:4px">${pd}</div></div>
-    <div class="q"><h3>2. What does their company look like?</h3>${firmoTxt||'(none)'}</div>
+    <div class="q"><h3>2. What does their company look like?</h3>${firmoTxt||'(none — no verified company record found)'}${suppliedTxt}${genTxt}</div>
     <div class="q"><h3>3. What is their company trying to do this year?</h3>${pr}${fusedTxt?`<div style="margin-top:8px"><b>Fused signals (cross-source):</b></div><div style="margin-top:4px">${fusedTxt}</div>`:''}</div>
-    <div class="q"><h3>Unknowns</h3>${un||'(none)'}</div>
-    ${dg?`<div class="q"><h3>Degraded inputs</h3>${dg}</div>`:''}
     <div style="margin-top:8px"><button id="srcbtn" style="width:auto" onclick="toggleSources()">Show sources</button>
     <div id="srcpanel" style="display:none; margin-top:8px; border-top:1px solid var(--line); padding-top:8px;">
       <h3 style="font-size:13px">Sources</h3>

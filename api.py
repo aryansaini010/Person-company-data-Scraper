@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from prospect_intel import audit
 from prospect_intel.acquisition import acquire
 from prospect_intel.discovery import discover_company, discover_person
@@ -30,6 +30,8 @@ FIRMO_MEM_MAX = 500
 briefs: dict[str, Brief] = {}
 sessions: dict = {}  # session_id -> {docs, degraded, collateral, name, ...}
 SESSION_TTL_S = 1800  # abandoned confirmations evaporate
+uploads: dict = {}  # upload_id -> {filename, rows, created_at, expires_at}
+UPLOAD_TTL_S = 3600.0  # participant lists live 1h
 import os as _os
 if _os.environ.get("WEB_CONCURRENCY", "") not in ("", "1"):
     try:
@@ -107,6 +109,142 @@ def _session_del(sid: str) -> None:
             _con.close()
     except Exception:
         pass
+
+
+def _upload_sweep() -> None:
+    now = time.time()
+    for uid in [u for u, v in uploads.items()
+                if now > v.get("expires_at", now)]:
+        uploads.pop(uid, None)
+    try:
+        from prospect_intel import store as _store
+        _con = _store.connect()
+        try:
+            _store.upload_sweep(_con, now)
+        finally:
+            _con.close()
+    except Exception:
+        pass
+
+
+def _upload_put(uid: str, filename: str, rows: list[dict]) -> None:
+    now = time.time()
+    uploads[uid] = {"filename": filename, "rows": rows,
+                    "created_at": now, "expires_at": now + UPLOAD_TTL_S}
+    if len(uploads) > 100:
+        try:
+            oldest = min(uploads.items(),
+                         key=lambda kv: kv[1].get("created_at", 0))[0]
+            uploads.pop(oldest, None)
+        except Exception:
+            pass
+    try:
+        from prospect_intel import store as _store
+        _con = _store.connect()
+        try:
+            _store.upload_save(_con, uid, filename, rows, UPLOAD_TTL_S)
+        finally:
+            _con.close()
+    except Exception:
+        pass
+
+
+def _upload_get(uid: str) -> tuple[str, list[dict]] | None:
+    ent = uploads.get(uid)
+    if ent is not None:
+        if time.time() > ent.get("expires_at", 0):
+            uploads.pop(uid, None)
+        else:
+            return ent.get("filename", ""), ent.get("rows", [])
+    try:
+        from prospect_intel import store as _store
+        _con = _store.connect()
+        try:
+            got = _store.upload_load(_con, uid)
+        finally:
+            _con.close()
+        if got is not None:
+            filename, rows = got
+            uploads[uid] = {"filename": filename, "rows": rows,
+                            "created_at": time.time(),
+                            "expires_at": time.time() + UPLOAD_TTL_S}
+            return filename, rows
+        return None
+    except Exception:
+        return None
+
+
+def _sanitize_user_supplied(raw: dict | None) -> dict:
+    """Allow-list participant fields; Phone/Mobile never pass through.
+
+    Keeps: position, company_raw, corp_email, email, company_phone,
+    country, participant_type, activity, full_name, display, pid.
+    Drops: phone, mobile (any casing) + unknown junk over 500 chars.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    keep = ("position", "company_raw", "company_primary", "corp_email",
+            "email", "company_phone", "country", "participant_type",
+            "activity", "full_name", "display", "pid",
+            "first_name", "last_name")
+    out: dict = {}
+    for k in keep:
+        v = raw.get(k, "")
+        if isinstance(v, str) and v.strip():
+            out[k] = v.strip()[:500]
+    return out
+
+
+def _apply_user_supplied(person, firmo: dict, degraded: list,
+                         user_supplied: dict | None) -> tuple:
+    """Bind participant row OUTSIDE the verifier (ground-truth, not evidence).
+
+    - Position -> person.title/role when empty (DB column exists).
+    - Official contacts -> firmo supplied_* keys (never clobbers verified).
+    - All labeled via degraded notes as user-supplied (unverified).
+    Returns (person, firmo). Mutates degraded in place.
+    """
+    us = _sanitize_user_supplied(user_supplied)
+    if not us:
+        return person, firmo
+    try:
+        pos = us.get("position", "")
+        if pos and not (getattr(person, "title", "") or getattr(person, "role", "")):
+            person.title = pos[:200]
+            person.role = pos[:200]
+            note = "position: user-supplied (unverified — from participant file)"
+            if note not in degraded:
+                degraded.append(note)
+    except Exception:
+        pass
+    try:
+        supplied: dict = {}
+        if us.get("corp_email"):
+            supplied["corp_email"] = us["corp_email"]
+        if us.get("email"):
+            supplied["email"] = us["email"]
+        if us.get("company_phone"):
+            supplied["company_phone"] = us["company_phone"]
+        if supplied:
+            firmo["contact_supplied"] = supplied
+            note = ("contact: user-supplied official channels (unverified — "
+                    "from participant file, Phone/Mobile excluded)")
+            if note not in degraded:
+                degraded.append(note)
+        if us.get("country"):
+            if not firmo.get("country_supplied"):
+                firmo["country_supplied"] = us["country"]
+        ctx = {k: us[k] for k in ("participant_type", "activity")
+               if us.get(k)}
+        if ctx:
+            firmo["participant_supplied"] = ctx
+        # Keep full row for export/UI (no Phone/Mobile — never in us).
+        firmo["row_supplied"] = {k: v for k, v in us.items()
+                                 if k in ("full_name", "display", "position",
+                                          "company_raw", "company_primary")}
+    except Exception:
+        pass
+    return person, firmo
 
 SEED_COLLATERAL = [
     "Platform scaling case study: helped an enterprise client grow engineering hiring while holding release quality.",
@@ -227,7 +365,8 @@ def _run_brief(name: str, company: str, docs: list[StructuredDoc],
                collateral: list[str],
                degraded: list[str] | None = None,
                firmo_extra: dict | None = None,
-               deadline: float | None = None) -> tuple[str, Brief]:
+               deadline: float | None = None,
+               user_supplied: dict | None = None) -> tuple[str, Brief]:
     from prospect_intel import deadline as _dl
     from prospect_intel.passes import pass1_candidates
     degraded = degraded or []
@@ -309,6 +448,78 @@ def _run_brief(name: str, company: str, docs: list[StructuredDoc],
                 firmo["sources"] = list(dict.fromkeys(firmo.get("sources", []) + [first]))[:5]
         except Exception:
             pass  # timeout/failure: keep probe none, gaps say so
+    # Company-depth fallback (authentic, bounded, 2-min budget):
+    # When the person is obscure, the person-biased discovery above yields
+    # ~0 docs. Company info still lives on the official site + news, so do
+    # a company-only refresh (Tier-3 legal for company-only queries):
+    # full diet bodies + owned newsroom/careers/investors acquisition.
+    # Skipped when <45s remain; caps +6 docs; never invents (verifier gates).
+    # Disabled under pytest for speed/determinism (unit tests stub tiers).
+    try:
+        import sys as _sys2
+        _under_test = ("PYTEST_CURRENT_TEST" in _os.environ
+                       or "pytest" in _sys2.modules)
+        _co = (person.company or "").strip()
+        _need_depth = (
+            not _under_test
+            and _co.lower() not in ("", "unknown")
+            and (firmo.get("website_probe", "none") in ("none", "", None)
+                 or firmo.get("homepage", "") in ("", "none")
+                 or firmo.get("funding", "unknown") == "unknown")
+            and not _dl.expired(deadline)
+            and (deadline - time.time() > 45 if deadline else True)
+        )
+        if _need_depth:
+            from prospect_intel.discovery import company_diet as _cdiet
+            from prospect_intel.passes import probe_company_pages as _probe2
+            from prospect_intel.acquisition import acquire as _acq2
+            from prospect_intel.schemas import SourceClass as _SC2
+            import concurrent.futures as _cf2
+            _owned2: dict = {}
+            try:
+                _ex2 = _cf2.ThreadPoolExecutor(max_workers=1)
+                try:
+                    _owned2 = _ex2.submit(_probe2, _co, deadline).result(timeout=20) or {}
+                finally:
+                    _ex2.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                _owned2 = {}
+            if _owned2:
+                try:
+                    _have_urls = {d.url_final or d.url for d in docs}
+                    for _role, _url in list(_owned2.items())[:3]:
+                        if _url in _have_urls or _dl.expired(deadline):
+                            continue
+                        _sc = (_SC2.JOB_POSTING if _role == "careers"
+                               else _SC2.PRESS_RELEASE if _role == "newsroom"
+                               else _SC2.VENDOR_PAGE)
+                        try:
+                            for _dd in _acq2([_url], _sc, deadline=deadline):
+                                if _dd.doc_id not in {d.doc_id for d in docs}:
+                                    docs.append(_dd)
+                                    if len(docs) >= 26:
+                                        break
+                        except Exception:
+                            continue
+                    _first2 = next(iter(_owned2.values()))
+                    if firmo.get("website_probe", "none") in ("none", "", None):
+                        firmo["website_probe"] = _first2
+                        firmo["probe_status"] = "owned-page"
+                        firmo["sources"] = list(dict.fromkeys(
+                            firmo.get("sources", []) + [_first2]))[:5]
+                except Exception:
+                    pass
+            try:
+                _before = len(docs)
+                _cdiet(_co, "", docs, degraded, fetch_full=True,
+                       max_angles=2, deadline=deadline)
+                # Cap diet growth so a huge company can't blow the 120s budget.
+                if len(docs) > _before + 6:
+                    del docs[_before + 6:]
+            except Exception:
+                pass
+    except Exception:
+        pass  # fallback best-effort: brief proceeds with what we have
     # Hunter-by-domain (free key, quota-guarded): the homepage above yields
     # a domain, which unlocks the company-enrichment lookup. Docs join the
     # evidence pool BEFORE Pass 3 so strategy/details see them; fields merge
@@ -319,6 +530,14 @@ def _run_brief(name: str, company: str, docs: list[StructuredDoc],
     try:
         from prospect_intel.passes import attach_hiring_velocity
         firmo = attach_hiring_velocity(docs, firmo)
+    except Exception:
+        pass
+    # Participant file (user-supplied ground truth, never verifier evidence).
+    # Position -> person.title/role; official contacts -> firmo supplied_*.
+    # Phone/Mobile never arrive here (_sanitize drops them).
+    try:
+        person, firmo = _apply_user_supplied(person, firmo, degraded,
+                                             user_supplied)
     except Exception:
         pass
     from prospect_intel.passes import firmographic_unknowns
@@ -334,6 +553,28 @@ def _run_brief(name: str, company: str, docs: list[StructuredDoc],
     verified, gaps = pass3_strategy(docs, tools, verifier, person.full_name,
                                     person.company,
                                     company_owned_hosts(firmo))
+    # Company-scope second pass (authentic): if the person has no footprint
+    # but the company-depth refresh above found official/news docs, surface
+    # company priorities instead of an empty Q3. Company-only query, so
+    # verifier + company-bound gates still apply — never invented.
+    if not verified and not _strong and docs and not _dl.expired(deadline):
+        try:
+            _cver, _cgaps = pass3_strategy(
+                docs, tools, verifier, "", person.company,
+                company_owned_hosts(firmo))
+            if _cver:
+                verified = _cver
+                # Keep company gaps that add information (dedupe).
+                for _g in _cgaps:
+                    if _g not in gaps:
+                        gaps.append(_g)
+                note = ("company-depth: person has no public footprint — "
+                        "showing verified company direction from official "
+                        "site + news")
+                if note not in degraded:
+                    degraded.append(note)
+        except Exception:
+            pass
     if not _strong:
         from prospect_intel.passes import gap as _gap
         gaps = list(gaps) + [_gap(f"person.{k}", "absent_data",
@@ -352,10 +593,32 @@ def _run_brief(name: str, company: str, docs: list[StructuredDoc],
     gaps = fgaps + gaps
     if _dl.expired(deadline):
         _incomplete_note(degraded)
+    # General-knowledge fallback (UNVERIFIED, never evidence): only when zero
+    # verified company data exists after all fallbacks. Local model through
+    # Open Web UI chat (gpt-oss:20b), backup direct Ollama same weights.
+    general: list[dict] = []
+    try:
+        _no_firmo = (
+            firmo.get("website_probe", "none") in ("none", "", None)
+            and firmo.get("homepage", "") in ("", "none")
+            and firmo.get("registry", "") in ("", "unknown",
+                                              "unverified-manual-check")
+        )
+        if (not verified and not docs and _no_firmo
+                and not _dl.expired(deadline)):
+            from prospect_intel.general import get_general_background
+            general, _ = get_general_background(person.company, deadline)
+            if general:
+                note = ("general-knowledge fallback shown separately "
+                        "(unverified — local model via Open Web UI)")
+                if note not in degraded:
+                    degraded.append(note)
+    except Exception:
+        general = []
     brief = Brief(person=person, firmographic=firmo,
                   strategy_signals=verified, gaps=gaps,
                   person_details=person_details, bio=bio,
-                  degraded=degraded or [])
+                  degraded=degraded or [], general_knowledge=general)
     brief = pass4_synthesize(brief, collateral or _collateral(), tools)
     brief = build_output_contract(brief, collateral or _collateral(), tools)
     bid = f"brief_{uuid.uuid4().hex[:12]}"
@@ -370,6 +633,7 @@ class BriefRequest(BaseModel):
     company: str
     docs: list[StructuredDoc] = []
     collateral: list[str] = []
+    user_supplied: dict = Field(default_factory=dict)
 
 
 class ResearchRequest(BaseModel):
@@ -380,6 +644,7 @@ class ResearchRequest(BaseModel):
     max_results: int = 5
     source_class: SourceClass = SourceClass.OTHER
     collateral: list[str] = []
+    user_supplied: dict = Field(default_factory=dict)
 
 
 class EntityResolveRequest(BaseModel):
@@ -404,7 +669,8 @@ def entity_confirm(p: PersonIdentity):
 @app.post("/briefs")
 def create_brief(req: BriefRequest):
     bid, brief = _run_brief(req.name, req.company, req.docs,
-                            req.collateral or _collateral())
+                            req.collateral or _collateral(),
+                            user_supplied=req.user_supplied)
     # Same profile card as the confirm path (roles + manual refs).
     try:
         from prospect_intel.passes import build_profile_card
@@ -496,7 +762,8 @@ def research(req: ResearchRequest):
         bid, brief = _run_brief(req.name, req.company, [], req.collateral,
                                 degraded,
                                 disc.firmo_extra if disc else None,
-                                deadline)
+                                deadline,
+                                _sanitize_user_supplied(req.user_supplied))
         # Keep manual-check refs (LinkedIn) even on a gaps-only brief —
         # otherwise Sources goes empty when discovery found no URLs.
         try:
@@ -514,7 +781,8 @@ def research(req: ResearchRequest):
         return {"status": "brief", "id": bid, "brief": brief, "fetched": 0,
                 "warning": "no fetchable documents; brief contains gaps only",
                 "doc_urls": {}, "evidence": [],
-                "unknowns": _unknowns_flat(brief)}
+                "unknowns": _unknowns_flat(brief),
+                "general_knowledge": _general_flat(brief)}
     from prospect_intel.passes import pass1_candidates
     cands = pass1_candidates(req.name, req.company or "unknown", docs)
     sid = f"sess_{uuid.uuid4().hex[:12]}"
@@ -528,6 +796,7 @@ def research(req: ResearchRequest):
                      "collateral": req.collateral, "name": req.name,
                      "company": req.company, "references": _sess_refs,
                      "firmo_extra": dict(disc.firmo_extra) if disc else {},
+                     "user_supplied": _sanitize_user_supplied(req.user_supplied),
                      "created_at": time.time(),
                      "shown": [c.model_dump() for c in cands]})
     _session_sweep()
@@ -570,7 +839,8 @@ def research_confirm(req: ResearchConfirm):
     from prospect_intel import deadline as _cdl
     bid, brief = _run_brief(sel.full_name, base_company or sel.company,
                             sess["docs"], sess["collateral"], sess["degraded"],
-                            sess.get("firmo_extra"), _cdl.start())
+                            sess.get("firmo_extra"), _cdl.start(),
+                            sess.get("user_supplied"))
     # bind the human-selected evidence, not a re-guessed identity —
     # except when the selection had no company: keep the doc-inferred one
     # (bare-name flow) instead of wiping it back to "unknown".
@@ -601,6 +871,7 @@ def research_confirm(req: ResearchConfirm):
     return {"status": "brief", "id": bid, "brief": brief,
             "doc_urls": doc_urls, "evidence": _evidence_flat(brief, doc_urls),
             "unknowns": _unknowns_flat(brief), "fused": _fused,
+            "general_knowledge": _general_flat(brief),
             **_auto_push_brief(bid, brief)}
 
 
@@ -608,6 +879,83 @@ class CompanyRequest(BaseModel):
     company: str
     max_results: int = 8
     collateral: list[str] = []
+
+
+@app.post("/participants/upload")
+def participants_upload(file: UploadFile = File(...)):
+    """Upload a participant list (.csv/.xlsx, multi-row).
+
+    Returns upload_id + people preview [{pid, display, full_name,
+    company_primary}]. Phone/Mobile are dropped on parse and never stored.
+    Best-effort partial: bad rows skipped with notes, good rows kept.
+    """
+    import uuid as _uuid
+    from prospect_intel.participants import MAX_BYTES, parse_upload
+    _upload_sweep()
+    fname = (file.filename or "").strip()[:200] or "upload"
+    lname = fname.lower()
+    if not (lname.endswith(".csv") or lname.endswith((".xlsx", ".xlsm"))):
+        raise HTTPException(400, "unsupported extension (use .csv or .xlsx)")
+    try:
+        data = file.file.read()
+    except Exception:
+        raise HTTPException(400, "unreadable upload")
+    if not data:
+        raise HTTPException(400, "empty file")
+    if len(data) > MAX_BYTES:
+        raise HTTPException(400, f"file too large (>{MAX_BYTES} bytes)")
+    rows, notes = parse_upload(fname, data)
+    if not rows:
+        raise HTTPException(400, "; ".join(notes) or "no data rows found")
+    uid = f"upl_{_uuid.uuid4().hex[:12]}"
+    _upload_put(uid, fname, rows)
+    try:
+        audit.log("participants_uploaded",
+                  {"id": uid, "file": fname, "rows": len(rows)})
+    except Exception:
+        pass
+    people = [{"pid": r.get("pid", ""), "display": r.get("display", ""),
+               "full_name": r.get("full_name", ""),
+               "company_primary": r.get("company_primary", "")}
+              for r in rows]
+    return {"upload_id": uid, "filename": fname, "count": len(rows),
+            "people": people, "notes": notes}
+
+
+@app.get("/participants/{upload_id}")
+def participants_list(upload_id: str):
+    """List people in an upload for the Name+Company selector."""
+    _upload_sweep()
+    got = _upload_get(upload_id)
+    if got is None:
+        raise HTTPException(404, "unknown/expired upload — re-upload")
+    filename, rows = got
+    people = [{"pid": r.get("pid", ""), "display": r.get("display", ""),
+               "full_name": r.get("full_name", ""),
+               "company_primary": r.get("company_primary", "")}
+              for r in rows]
+    return {"upload_id": upload_id, "filename": filename,
+            "count": len(rows), "people": people}
+
+
+@app.get("/participants/{upload_id}/{pid}")
+def participant_get(upload_id: str, pid: str):
+    """Return one row's usable fields (Phone/Mobile never present)."""
+    got = _upload_get(upload_id)
+    if got is None:
+        raise HTTPException(404, "unknown/expired upload — re-upload")
+    _, rows = got
+    for r in rows:
+        if r.get("pid") == pid:
+            # Explicit allow-list: Phone/Mobile can never leak even if
+            # a future parser keeps them.
+            safe = {k: r.get(k, "") for k in (
+                "pid", "full_name", "display", "first_name", "last_name",
+                "position", "company_raw", "company_primary", "corp_email",
+                "email", "company_phone", "country", "participant_type",
+                "activity")}
+            return {"upload_id": upload_id, "person": safe}
+    raise HTTPException(404, "unknown person in this upload")
 
 
 @app.post("/company-research")
@@ -761,6 +1109,27 @@ def company_research(req: CompanyRequest):
     gaps = brief.gaps + ["person.unknown: company-only brief — no person "
                          "researched, nothing inferred"]
     brief.gaps = gaps
+    # General-knowledge fallback for company-only zero-data case too.
+    try:
+        _no_firmo_c = (
+            firmo.get("website_probe", "none") in ("none", "", None)
+            and firmo.get("homepage", "") in ("", "none")
+            and firmo.get("registry", "") in ("", "unknown",
+                                              "unverified-manual-check")
+        )
+        if (not verified and not docs and _no_firmo_c
+                and not _odl.expired(deadline)):
+            from prospect_intel.general import get_general_background
+            _gen_c, _ = get_general_background(company, deadline)
+            if _gen_c:
+                brief.general_knowledge = _gen_c
+                note_c = ("general-knowledge fallback shown separately "
+                          "(unverified — local model via Open Web UI)")
+                if note_c not in degraded:
+                    degraded.append(note_c)
+                    brief.degraded = degraded
+    except Exception:
+        pass
     brief = pass4_synthesize(brief, req.collateral or _collateral(), tools)
     brief = build_output_contract(brief, req.collateral or _collateral(),
                                   tools)
@@ -785,6 +1154,7 @@ def company_research(req: CompanyRequest):
             "fetched": len(docs), "doc_urls": doc_urls,
             "evidence": _evidence_flat(brief, doc_urls),
             "unknowns": _unknowns_flat(brief), "fused": fused,
+            "general_knowledge": _general_flat(brief),
             "timings": _timings, **_auto_push_brief(bid, brief)}
 
 
@@ -806,6 +1176,18 @@ def _evidence_flat(brief: Brief, doc_urls: dict) -> list[dict]:
 def _unknowns_flat(brief: Brief) -> list[dict]:
     return [{"field": (g.split(":")[0] if ":" in g else "general"),
              "code": "unknown", "detail": g} for g in (brief.gaps or [])]
+
+
+def _general_flat(brief: Brief) -> list[dict]:
+    """Unverified general background: separate lane, never evidence."""
+    out = []
+    for g in (getattr(brief, "general_knowledge", None) or []):
+        if isinstance(g, dict) and (g.get("text") or "").strip():
+            out.append({"text": g["text"][:500],
+                        "label": g.get("label", "GENERAL-KNOWLEDGE-UNVERIFIED"),
+                        "model": g.get("model", ""),
+                        "via": g.get("via", "")})
+    return out
 
 
 @app.get("/briefs/{bid}/readable.txt", response_class=PlainTextResponse)

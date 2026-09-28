@@ -8,11 +8,12 @@ def test_ui_serves():
     assert r.status_code == 200
     for marker in ("Run a brief", "What is their company trying",
                    "/research", "/research/confirm", "Show sources",
-                   "Company brief", "/company-research",
+                   "Participants", "/participants/upload",
                    "REQ_TIMEOUT_MS", "timed out after 4 min"):
         assert marker in r.text
     for gone in ("Show extraction logs", "Ops metrics", "/audit/tail",
-                 'value="Mukesh Ambani"', 'value="Reliance Industries"'):
+                 'value="Mukesh Ambani"', 'value="Reliance Industries"',
+                 "Company brief (no person needed)", 'id="cocompany"'):
         assert gone not in r.text
 
 def test_root_redirects_to_ui():

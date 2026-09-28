@@ -166,3 +166,7 @@ class Brief(BaseModel):
     # extractors over verified docs; each item is evidence-bound.
     bio: dict = Field(default_factory=dict)
     degraded: list[str] = Field(default_factory=list)  # §10.2 loud degradation
+    # General background (UNVERIFIED, never evidence): LLM general knowledge
+    # shown only when zero verified docs exist (e.g. unknown company).
+    # Never enters strategy_signals/priorities/evidence/verdicts.
+    general_knowledge: list[dict] = Field(default_factory=list)
